@@ -1,0 +1,38 @@
+# Cloudflare Pages _headers file
+
+# 静态资源 — 长期缓存(文件名带 hash 后可改 immutable)
+/data/*.gz
+  Cache-Control: public, max-age=31536000, immutable
+  Content-Type: application/json
+
+# 全量数据 — 1 天(用户会多次 fetch)
+/data/books.json
+  Cache-Control: public, max-age=86400
+  Content-Type: application/json; charset=utf-8
+
+# 索引 — 1 小时(数据更新频繁)
+/data/index.json
+  Cache-Control: public, max-age=3600
+  Content-Type: application/json; charset=utf-8
+
+/data/meta.json
+  Cache-Control: public, max-age=3600
+  Content-Type: application/json; charset=utf-8
+
+# CSV — 1 天(供下载)
+/data/books.csv
+  Cache-Control: public, max-age=86400
+  Content-Type: text/csv; charset=utf-8
+
+# JS / HTML — 短缓存,方便快速迭代
+/*.js
+  Cache-Control: public, max-age=300
+
+/*.html
+  Cache-Control: public, max-age=300
+
+# 安全头
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer-when-downgrade
+  X-Frame-Options: DENY

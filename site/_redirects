@@ -1,0 +1,3 @@
+# Cloudflare Pages _redirects
+# 根路径 → index.html(默认行为)
+# /download → 下载完整数据包(.csv)

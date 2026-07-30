@@ -1,29 +1,33 @@
-/* 阿超知识库 — 前端引擎
+/* 阿超知识库 — 前端引擎 v2
  * ============================
- * 三档加载:
- *   1. meta.json  (3 KB)        — 启动 fetch,拿到统计 + top-50
- *   2. index.json (~535 KB gz) — 启动 fetch,精简书目(无链接)
- *   3. books.json (~1 MB gz)   — 首次「下载」时 fetch,带链接的全量
- *
- * 状态:
- *   - 搜索/过滤/tag/bookshelf:全部基于 index(无网络)
- *   - 下载/批量下载:惰性加载 books.json,缓存到 window 全局
+ * Layout: 左侧目录栏 + 主区(顶栏 + 免责横幅 + 统计 + 搜索 + 卡片网格)
+ * 加载: meta.json + index.json 一次拉完;books.json 惰性下载时拉
+ * 本地: 上传的书存 localStorage,合并进内存索引;localStorage 累积点击 → 个人热榜
  */
 (() => {
 'use strict';
 
 const DATA = 'data/';
-const STORAGE_KEY = 'achaokb_bookshelf_v1';
+const LS_KEYS = {
+  shelf:    'achaokb_bookshelf_v1',
+  uploads:  'achaokb_uploads_v1',
+  clicks:   'achaokb_clicks_v1',
+  hidden:   'achaokb_disclaimer_hidden_v1',
+};
 
 const state = {
   meta: null,
-  index: null,           // 24k × {i,t,a,c,d}
-  books: null,           // 24k × {i,t,a,c,d,l,f} — lazy
-  booksLoading: null,    // Promise (避免重复 fetch)
+  index: [],          // [{i,t,a,c,d,p,y,lang,g}, ...] (本地 + 远端合并)
+  remoteIndex: [],    // 远端 books 索引,远程 id >= 0
+  localIndex: [],     // 本地上传,本地 id = -1, -2, ...
+  remoteBooks: null,  // 完整链接 (惰性)
+  remoteBooksLoading: null,
   query: '',
-  activeTag: null,
+  filters: { type: 'all', group: null, sub: null },  // type: all|local|shelf, group/sub: 一级/二级
   selected: new Set(),
-  shelf: loadShelf(),
+  shelf: loadLS(LS_KEYS.shelf, {}),
+  uploads: loadLS(LS_KEYS.uploads, []),
+  clicks: loadLS(LS_KEYS.clicks, {}),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -33,7 +37,7 @@ const els = {
   searchWrap: $('searchWrap'),
   searchClear: $('searchClear'),
   resultMeta: $('resultMeta'),
-  tags: $('tags'),
+  activeFilterChips: $('activeFilterChips'),
   grid: $('grid'),
   fab: $('fab'),
   fabCount: $('fabCount'),
@@ -46,18 +50,47 @@ const els = {
   bookshelfCount: $('bookshelfCount'),
   drawer: $('drawer'),
   drawerBg: $('drawerBg'),
-  drawerClose: $('drawerClose'),
   drawerBody: $('drawerBody'),
+  uploadDrawer: $('uploadDrawer'),
+  disclaimerDrawer: $('disclaimerDrawer'),
   bulkDownloadBtn: $('bulkDownloadBtn'),
-  bulkDownloadInfo: $('bulkDownloadInfo'),
+  taxonomy: $('taxonomy'),
+  hotList: $('hotList'),
+  navAll: $('navAll'),
+  navAllCount: $('navAllCount'),
+  navLocal: $('navLocal'),
+  navLocalCount: $('navLocalCount'),
+  navShelf: $('navShelf'),
+  navShelfCount: $('navShelfCount'),
+  disclaimer: $('disclaimer'),
+  disclaimerClose: $('disclaimerClose'),
+  openDisclaimerBtn: $('openDisclaimerBtn'),
+  openDisclaimerBtn2: $('openDisclaimerBtn2'),
+  openUploadBtn: $('openUploadBtn'),
+  toggleSidebarBtn: $('toggleSidebarBtn'),
+  sidebar: $('sidebar'),
+  sidebarOverlay: $('sidebarOverlay'),
+  uploadForm: $('uploadForm'),
+  upTitle: $('upTitle'),
+  upAuthor: $('upAuthor'),
+  upGroup: $('upGroup'),
+  upDesc: $('upDesc'),
+  upDrop: $('upDrop'),
+  upFile: $('upFile'),
+  upFileInfo: $('upFileInfo'),
+  uploadList: $('uploadList'),
 };
 
-// ---------- fetch helpers ----------
+// ---------- fetch ----------
 async function fetchJSON(url) {
   const r = await fetch(url, { credentials: 'omit' });
   if (!r.ok) throw new Error(`${url}: ${r.status}`);
   return r.json();
 }
+
+// ---------- LS helpers ----------
+function loadLS(key, def) { try { return JSON.parse(localStorage.getItem(key)) ?? def; } catch { return def; } }
+function saveLS(key, val) { localStorage.setItem(key, JSON.stringify(val)); }
 
 // ---------- 启动 ----------
 async function init() {
@@ -67,67 +100,170 @@ async function init() {
       fetchJSON(DATA + 'index.json'),
     ]);
     state.meta = meta;
-    state.index = index;
+    state.remoteIndex = index;
+    rebuildMergedIndex();
+    renderTaxonomy();
+    renderHot();
     renderStats();
-    renderTags();
-    updateBookshelfCount();
+    populateUploadGroups();
+    updateCounts();
+    if (loadLS(LS_KEYS.hidden, false)) els.disclaimer.classList.add('hidden');
     applyFilter();
-    els.bulkDownloadInfo.textContent = `(${formatBytes(meta.total * 200)} 数据)`;
+    setupUploader();
   } catch (e) {
     console.error(e);
     els.grid.innerHTML = `<div class="empty"><p class="empty-title">加载失败</p><p class="empty-sub">${escapeHtml(String(e.message))}</p></div>`;
   }
 }
 
-function renderStats() {
-  const m = state.meta;
-  if (!m) return;
-  const authors = new Set();
-  let fmt = 0;
-  for (const b of state.index) { if (b.a) authors.add(b.a); }
-  for (const c of m.top) fmt += c.count * 3; // 估算
-  const cats = m.top.length + (m.other_count ? 1 : 0);
-
-  els.stats.innerHTML = `
-    <div class="stat"><div class="stat-num">${m.total.toLocaleString()}</div><div class="stat-label">总书目</div></div>
-    <div class="stat"><div class="stat-num">${cats}</div><div class="stat-label">主分类</div></div>
-    <div class="stat"><div class="stat-num">${authors.size.toLocaleString()}</div><div class="stat-label">作者</div></div>
-    <div class="stat"><div class="stat-num">${fmt.toLocaleString()}+</div><div class="stat-label">格式覆盖</div></div>
-  `;
+function rebuildMergedIndex() {
+  // 远端在前(保留正向 id),本地的 id 用负数,避免冲突
+  state.localIndex = state.uploads.map((u, i) => ({
+    i: -(i + 1), t: u.t, a: u.a || '', c: u.c || '',
+    d: u.d || '本地上传', p: u.p || '—', y: u.y || '—',
+    lang: u.lang || '—', g: u.g || '其他细分',
+    l: '', f: u.f ? [u.f] : [], local: true, _uploadId: u.id,
+  }));
+  state.index = state.remoteIndex.concat(state.localIndex);
 }
 
-function renderTags() {
-  const m = state.meta;
-  if (!m) return;
-  let html = `<span class="tag ${state.activeTag === null ? 'active' : ''}" data-tag="">全部<span class="tag-count">${m.total}</span></span>`;
-  for (const c of m.top) {
-    html += `<span class="tag ${state.activeTag === c.name ? 'active' : ''}" data-tag="${escapeAttr(c.name)}">${escapeHtml(c.name)}<span class="tag-count">${c.count}</span></span>`;
+// ---------- 侧边栏: 分类目录 ----------
+function renderTaxonomy() {
+  const tx = state.meta.taxonomy;
+  let html = '';
+  for (const g of tx) {
+    const isOpen = state.filters.group === g.name;
+    html += `<div class="nav-group ${isOpen ? 'open' : ''}" data-group="${escapeAttr(g.name)}">
+      <div class="nav-group-head ${state.filters.group === g.name ? 'active' : ''}" data-toggle-group="${escapeAttr(g.name)}">
+        <span>${g.icon} ${escapeHtml(g.name)}</span>
+        <span style="display:flex;align-items:center;gap:6px"><span class="nav-item-count">${g.count}</span><span class="nav-group-arrow">▶</span></span>
+      </div>
+      <div class="nav-group-children">
+        <div class="nav-item" data-sub="__all__" data-group="${escapeAttr(g.name)}">
+          <span>全部 ${escapeHtml(g.name)}</span><span class="nav-item-count">${g.count}</span>
+        </div>
+        ${g.subs.map(s => `<div class="nav-item" data-sub="${escapeAttr(s.name)}" data-group="${escapeAttr(g.name)}"><span>${escapeHtml(s.name)}</span><span class="nav-item-count">${s.count}</span></div>`).join('')}
+      </div>
+    </div>`;
   }
-  if (m.other_count) {
-    html += `<span class="tag ${state.activeTag === '其他' ? 'active' : ''}" data-tag="其他">其他<span class="tag-count">${m.other_count}</span></span>`;
-  }
-  els.tags.innerHTML = html;
-  els.tags.querySelectorAll('.tag').forEach(el => {
+  els.taxonomy.innerHTML = html;
+  els.taxonomy.querySelectorAll('[data-toggle-group]').forEach(el => {
     el.addEventListener('click', () => {
-      state.activeTag = el.dataset.tag === '' ? null : el.dataset.tag;
-      renderTags();
-      applyFilter();
+      const name = el.dataset.toggleGroup;
+      if (state.filters.group === name) {
+        state.filters.group = null; state.filters.sub = null;
+      } else {
+        state.filters.group = name;
+      }
+      renderTaxonomy(); applyFilter();
+    });
+  });
+  els.taxonomy.querySelectorAll('[data-sub]').forEach(el => {
+    el.addEventListener('click', () => {
+      const g = el.dataset.group, s = el.dataset.sub;
+      state.filters.group = g;
+      state.filters.sub = (s === '__all__') ? null : s;
+      renderTaxonomy(); applyFilter();
     });
   });
 }
 
+// ---------- 侧边栏: 热门 ----------
+function renderHot() {
+  // 合并: 远端 top-50 + 用户本地点击累积 top-10
+  const remote = state.meta.popular || [];
+  const userTop = Object.entries(state.clicks)
+    .map(([k, n]) => ({ i: parseInt(k), n }))
+    .sort((a, b) => b.n - a.n)
+    .slice(0, 10)
+    .filter(x => x.n > 0)
+    .map(x => {
+      const b = state.remoteIndex[x.i];
+      if (!b) return null;
+      return { i: x.i, t: b.t, a: b.a, c: b.c, _userClicks: x.n };
+    })
+    .filter(Boolean);
+
+  let html = '';
+  remote.slice(0, 10).forEach((b, idx) => {
+    html += `<div class="hot-item" data-hot-i="${b.i}">
+      <span class="hot-rank ${idx < 3 ? 'top' : ''}">${idx + 1}</span>
+      <span class="hot-text">
+        <span class="hot-title">${escapeHtml(b.t)}</span>
+        <span class="hot-meta">${escapeHtml(b.a || '佚名')} · ${escapeHtml(b.c)}</span>
+      </span>
+    </div>`;
+  });
+  if (userTop.length > 0) {
+    html += `<div style="font-size:10px;color:var(--fg-faint);padding:6px 10px 2px;letter-spacing:.04em">📊 你常翻的</div>`;
+    userTop.forEach((b, idx) => {
+      html += `<div class="hot-item" data-hot-i="${b.i}">
+        <span class="hot-rank">${b._userClicks}</span>
+        <span class="hot-text">
+          <span class="hot-title">${escapeHtml(b.t)}</span>
+          <span class="hot-meta">${escapeHtml(b.a || '佚名')} · ${escapeHtml(b.c)}</span>
+        </span>
+      </div>`;
+    });
+  }
+  els.hotList.innerHTML = html;
+  els.hotList.querySelectorAll('[data-hot-i]').forEach(el => {
+    el.addEventListener('click', () => {
+      const i = parseInt(el.dataset.hotI);
+      const b = state.remoteIndex[i];
+      if (b) {
+        state.query = b.t;
+        els.searchInput.value = b.t;
+        els.searchWrap.classList.add('has-query');
+        applyFilter();
+        toast(`跳到《${b.t}》`);
+      }
+    });
+  });
+}
+
+// ---------- 统计 ----------
+function renderStats() {
+  const m = state.meta;
+  const authors = new Set();
+  for (const b of state.remoteIndex) if (b.a) authors.add(b.a);
+  els.stats.innerHTML = `
+    <div class="stat"><div class="stat-num">${(m.total + state.localIndex.length).toLocaleString()}</div><div class="stat-label">总书目</div></div>
+    <div class="stat"><div class="stat-num">${m.taxonomy.filter(g => !g.is_long_tail).length}</div><div class="stat-label">一级目录</div></div>
+    <div class="stat"><div class="stat-num">${m.categories.toLocaleString()}</div><div class="stat-label">细分标签</div></div>
+    <div class="stat"><div class="stat-num">${authors.size.toLocaleString()}</div><div class="stat-label">作者</div></div>
+    <div class="stat"><div class="stat-num">${state.localIndex.length}</div><div class="stat-label">本地上传</div></div>
+  `;
+}
+
+function updateCounts() {
+  els.navAllCount.textContent = state.index.length.toLocaleString();
+  els.navLocalCount.textContent = state.localIndex.length;
+  els.navShelfCount.textContent = Object.keys(state.shelf).filter(k => state.shelf[k]).length;
+  els.bookshelfCount.textContent = els.navShelfCount.textContent;
+  // nav active
+  const setActive = (id, on) => els[id].classList.toggle('active', on);
+  setActive('navAll', state.filters.type === 'all');
+  setActive('navLocal', state.filters.type === 'local');
+  setActive('navShelf', state.filters.type === 'shelf');
+}
+
+// ---------- 过滤 ----------
 function applyFilter() {
   const q = state.query.trim().toLowerCase();
   const kws = q ? q.split(/\s+/) : [];
-  const tag = state.activeTag;
+  const { type, group, sub } = state.filters;
   const idx = state.index;
   const filtered = [];
 
   for (let i = 0; i < idx.length; i++) {
     const b = idx[i];
-    if (tag && b.c !== tag) continue;
+    if (type === 'local' && !b.local) continue;
+    if (type === 'shelf' && !state.shelf[b.i]) continue;
+    if (group && b.g !== group) continue;
+    if (sub && b.c !== sub) continue;
     if (kws.length === 0) { filtered.push({ idx: i, b, matched: null }); continue; }
-    const hay = (b.t + ' ' + b.a + ' ' + b.c + ' ' + b.d).toLowerCase();
+    const hay = (b.t + ' ' + b.a + ' ' + b.c + ' ' + b.d + ' ' + b.g).toLowerCase();
     let matched = null, ok = true;
     for (const k of kws) {
       if (!k) continue;
@@ -139,14 +275,35 @@ function applyFilter() {
   }
 
   renderGrid(filtered);
-  els.resultMeta.textContent = filtered.length === state.index.length
-    ? `${state.index.length.toLocaleString()} 本`
-    : `${filtered.length.toLocaleString()} / ${state.index.length.toLocaleString()} 本`;
+  const total = state.index.length;
+  els.resultMeta.textContent = filtered.length === total
+    ? `${total.toLocaleString()} 本`
+    : `${filtered.length.toLocaleString()} / ${total.toLocaleString()} 本`;
+
+  // active filter chips
+  const chips = [];
+  if (type !== 'all') chips.push({ label: type === 'local' ? '📂 本地' : '⭐ 收藏', key: 'type' });
+  if (group) chips.push({ label: `${group}${sub ? '/' + sub : ''}`, key: 'sub' });
+  if (q) chips.push({ label: `"${q}"`, key: 'q' });
+  els.activeFilterChips.innerHTML = chips.map(c =>
+    `<span class="chip">${escapeHtml(c.label)}<span class="chip-x" data-clear="${c.key}">×</span></span>`
+  ).join('');
+  els.activeFilterChips.querySelectorAll('[data-clear]').forEach(el => {
+    el.addEventListener('click', () => {
+      const k = el.dataset.clear;
+      if (k === 'type') { state.filters.type = 'all'; updateCounts(); }
+      else if (k === 'sub') { state.filters.sub = null; state.filters.group = null; renderTaxonomy(); }
+      else if (k === 'q') { els.searchInput.value = ''; state.query = ''; els.searchWrap.classList.remove('has-query'); }
+      applyFilter();
+    });
+  });
+  updateCounts();
 }
 
+// ---------- 卡片 ----------
 function renderGrid(items) {
   if (items.length === 0) {
-    els.grid.innerHTML = `<div class="empty"><p class="empty-title">没有匹配的书</p><p class="empty-sub">试试别的关键词,或换一个分类标签</p></div>`;
+    els.grid.innerHTML = `<div class="empty"><p class="empty-title">没有匹配的书</p><p class="empty-sub">试试别的关键词,或换个分类/目录</p></div>`;
     return;
   }
   const MAX = 500;
@@ -155,10 +312,19 @@ function renderGrid(items) {
 
   for (const { idx, b, matched } of slice) {
     const card = document.createElement('div');
-    card.className = 'card' + (state.selected.has(idx) ? ' selected' : '');
+    card.className = 'card'
+      + (state.selected.has(idx) ? ' selected' : '')
+      + (b.local ? ' local' : '');
 
     const titleHtml = matched ? highlight(b.t, matched.k) : escapeHtml(b.t);
     const authorHtml = b.a ? (matched ? highlight(b.a, matched.k) : escapeHtml(b.a)) : '<span style="opacity:.4">佚名</span>';
+
+    // meta line: 出版社 · 年份 · 语言
+    const metaParts = [];
+    if (b.p && b.p !== '—') metaParts.push(`<span>出版社: ${escapeHtml(b.p)}</span>`);
+    if (b.y && b.y !== '—') metaParts.push(`<span>${escapeHtml(b.y)}</span>`);
+    if (b.lang && b.lang !== '—') metaParts.push(`<span>${escapeHtml(b.lang)}</span>`);
+    const metaHtml = metaParts.length ? metaParts.join('<span class="sep">·</span>') : '';
 
     card.innerHTML = `
       <div class="card-head">
@@ -166,14 +332,15 @@ function renderGrid(items) {
         <div class="card-body">
           <p class="card-title">${titleHtml}</p>
           <p class="card-author">${authorHtml}</p>
+          ${metaHtml ? `<p class="card-meta">${metaHtml}</p>` : ''}
           <p class="card-desc">${escapeHtml(b.d)}</p>
           <div class="card-foot">
-            <span class="card-tag">${escapeHtml(b.c)}</span>
-            <span class="card-formats"><span class="fmt">epub</span><span class="fmt">mobi</span><span class="fmt">azw3</span></span>
+            <span class="card-tag ${b.local ? 'local' : ''}">${escapeHtml(b.c || b.g)}</span>
+            <span class="card-formats">${(b.f || []).slice(0,3).map(f => `<span class="fmt">${escapeHtml(f)}</span>`).join('') || '<span class="fmt">本地</span>'}</span>
           </div>
           <div class="card-actions">
             <button class="btn btn-primary" data-act="download">下载 →</button>
-            <button class="btn btn-bookshelf ${state.shelf[idx] ? 'on' : ''}" data-act="shelf">${state.shelf[idx] ? '★ 已收藏' : '☆ 收藏'}</button>
+            <button class="btn btn-ghost ${state.shelf[b.i] ? 'on' : ''}" data-act="shelf">${state.shelf[b.i] ? '★ 已收藏' : '☆ 收藏'}</button>
           </div>
         </div>
       </div>
@@ -184,17 +351,16 @@ function renderGrid(items) {
       card.classList.toggle('selected', e.target.checked);
       updateFab();
     });
-
     card.querySelector('[data-act="download"]').addEventListener('click', () => downloadOne(idx));
     card.querySelector('[data-act="shelf"]').addEventListener('click', e => {
-      state.shelf[idx] = !state.shelf[idx];
-      if (!state.shelf[idx]) delete state.shelf[idx];
-      saveShelf();
+      state.shelf[b.i] = !state.shelf[b.i];
+      if (!state.shelf[b.i]) delete state.shelf[b.i];
+      saveLS(LS_KEYS.shelf, state.shelf);
       const btn = e.currentTarget;
-      btn.classList.toggle('on', !!state.shelf[idx]);
-      btn.textContent = state.shelf[idx] ? '★ 已收藏' : '☆ 收藏';
-      updateBookshelfCount();
-      toast(state.shelf[idx] ? '已加入收藏夹' : '已移出收藏夹');
+      btn.classList.toggle('on', !!state.shelf[b.i]);
+      btn.textContent = state.shelf[b.i] ? '★ 已收藏' : '☆ 收藏';
+      updateCounts();
+      toast(state.shelf[b.i] ? '已加入收藏夹' : '已移出收藏夹');
     });
 
     frag.appendChild(card);
@@ -210,28 +376,44 @@ function renderGrid(items) {
   }
 }
 
-// ---------- 下载 (惰性加载 books.json) ----------
-async function ensureBooks() {
-  if (state.books) return state.books;
-  if (state.booksLoading) return state.booksLoading;
-  state.booksLoading = (async () => {
+// ---------- 下载 ----------
+async function ensureRemoteBooks() {
+  if (state.remoteBooks) return state.remoteBooks;
+  if (state.remoteBooksLoading) return state.remoteBooksLoading;
+  state.remoteBooksLoading = (async () => {
     toast('首次下载,正在加载完整链接 (~1 MB)…');
     const data = await fetchJSON(DATA + 'books.json');
-    state.books = data;
+    state.remoteBooks = data;
     return data;
   })();
-  return state.booksLoading;
+  return state.remoteBooksLoading;
 }
 
 async function downloadOne(idx) {
-  try {
-    const books = await ensureBooks();
-    const b = books[idx];
-    if (!b || !b.l) { toast('链接缺失'); return; }
-    window.open(b.l, '_blank', 'noopener');
-  } catch (e) {
-    toast('加载失败:' + e.message);
+  const b = state.index[idx];
+  if (!b) return;
+  if (b.local) {
+    // 本地: 从 uploads 找到,生成 blob 下载
+    const u = state.uploads.find(x => x.id === b._uploadId);
+    if (!u) { toast('本地文件丢失'); return; }
+    recordClick(idx);
+    downloadBlob(u._dataUrl, u._filename, u._mime);
+    return;
   }
+  // 远端: 用 books.json 拿链接
+  try {
+    const books = await ensureRemoteBooks();
+    const full = books[idx];
+    if (!full || !full.l) { toast('链接缺失'); return; }
+    recordClick(idx);
+    window.open(full.l, '_blank', 'noopener');
+  } catch (e) { toast('加载失败'); }
+}
+
+function recordClick(idx) {
+  state.clicks[idx] = (state.clicks[idx] || 0) + 1;
+  saveLS(LS_KEYS.clicks, state.clicks);
+  renderHot();
 }
 
 // ---------- FAB ----------
@@ -240,45 +422,61 @@ function updateFab() {
   els.fabCount.textContent = n;
   els.fab.classList.toggle('show', n > 0);
 }
-
 els.fabDownload.addEventListener('click', async () => {
   const ids = [...state.selected];
   if (ids.length === 0) return;
-  try {
-    const books = await ensureBooks();
-    toast(`将打开 ${ids.length} 个新标签 — 在网盘页点「普通下载」`);
-    ids.forEach((id, i) => {
-      const b = books[id];
-      if (b && b.l) setTimeout(() => window.open(b.l, '_blank', 'noopener'), i * 250);
-    });
-  } catch (e) { toast('加载失败'); }
+  let opened = 0;
+  for (const id of ids) {
+    const b = state.index[id];
+    if (!b) continue;
+    if (b.local) {
+      const u = state.uploads.find(x => x.id === b._uploadId);
+      if (u) { downloadBlob(u._dataUrl, u._filename, u._mime); opened++; }
+    } else {
+      try {
+        const books = await ensureRemoteBooks();
+        const full = books[id];
+        if (full && full.l) { setTimeout(() => window.open(full.l, '_blank', 'noopener'), opened * 250); opened++; }
+      } catch {}
+    }
+  }
+  toast(`打开了 ${opened} 本`);
 });
-
 els.fabExport.addEventListener('click', async () => {
   const ids = [...state.selected];
   if (ids.length === 0) return;
   try {
-    const books = await ensureBooks();
     const lines = ['﻿书名\t作者\t分类\t链接'];
-    ids.forEach(id => { const b = books[id]; if (b) lines.push(`${b.t}\t${b.a}\t${b.c}\t${b.l}`); });
+    for (const id of ids) {
+      const b = state.index[id];
+      if (!b) continue;
+      let url = '';
+      if (b.local) {
+        const u = state.uploads.find(x => x.id === b._uploadId);
+        url = u ? `[本地文件 ${u._filename}]` : '';
+      } else {
+        const books = await ensureRemoteBooks();
+        url = books[id]?.l || '';
+      }
+      lines.push(`${b.t}\t${b.a}\t${b.c}\t${url}`);
+    }
     downloadBlob(lines.join('\n'), `achaokb-${ids.length}-${Date.now()}.txt`, 'text/plain;charset=utf-8');
     toast(`已导出 ${ids.length} 条链接`);
   } catch (e) { toast('加载失败'); }
 });
-
 els.fabClear.addEventListener('click', () => {
   state.selected.clear();
   applyFilter();
   updateFab();
 });
 
-// ---------- 完整数据包下载 ----------
+// ---------- 数据包下载 ----------
 els.bulkDownloadBtn.addEventListener('click', () => {
   const choice = prompt(
     '选择下载格式:\n' +
-    '  1 — JSON (gzip, ~900 KB) - 适合任何脚本\n' +
-    '  2 — CSV (~3.5 MB)         - 适合 Excel / pandas / SQLite\n' +
-    '  3 — JSON 原始 (~4.5 MB)   - 适合直接阅读\n\n' +
+    '  1 — JSON (gzip, ~900 KB)   适合任何脚本\n' +
+    '  2 — CSV (~4 MB)             适合 Excel / pandas / SQLite\n' +
+    '  3 — JSON 原始 (~6 MB)       适合直接阅读\n\n' +
     '输入 1 / 2 / 3:'
   );
   const map = { '1': 'books.json.gz', '2': 'books.csv', '3': 'books.json' };
@@ -287,9 +485,7 @@ els.bulkDownloadBtn.addEventListener('click', () => {
   const a = document.createElement('a');
   a.href = DATA + file;
   a.download = 'achao-knowledge-base-' + file;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
+  document.body.appendChild(a); a.click(); a.remove();
   toast(`开始下载 ${file}`);
 });
 
@@ -314,58 +510,208 @@ els.randomPickBtn.addEventListener('click', () => {
   const idx = Math.floor(Math.random() * n);
   const b = state.index[idx];
   state.query = b.t;
-  state.activeTag = null;
   els.searchInput.value = b.t;
   els.searchWrap.classList.add('has-query');
-  renderTags();
   applyFilter();
   toast(`随机: 《${b.t}》 · ${b.a || '佚名'}`);
 });
 
-// ---------- 收藏夹 ----------
-function loadShelf() { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch { return {}; } }
-function saveShelf() { localStorage.setItem(STORAGE_KEY, JSON.stringify(state.shelf)); }
-function updateBookshelfCount() { els.bookshelfCount.textContent = Object.keys(state.shelf).length; }
+// ---------- 顶部导航 ----------
+els.navAll.addEventListener('click', () => { state.filters.type = 'all'; applyFilter(); });
+els.navLocal.addEventListener('click', () => { state.filters.type = 'local'; applyFilter(); });
+els.navShelf.addEventListener('click', () => { state.filters.type = 'shelf'; applyFilter(); });
 
+// ---------- 收藏夹抽屉 ----------
 function openBookshelf() { renderBookshelf(); els.drawer.classList.add('show'); els.drawerBg.classList.add('show'); }
 function closeBookshelf() { els.drawer.classList.remove('show'); els.drawerBg.classList.remove('show'); }
 els.openBookshelfBtn.addEventListener('click', openBookshelf);
-els.drawerClose.addEventListener('click', closeBookshelf);
-els.drawerBg.addEventListener('click', closeBookshelf);
-
 function renderBookshelf() {
   const keys = Object.keys(state.shelf).filter(k => state.shelf[k]);
   if (keys.length === 0) {
     els.drawerBody.innerHTML = '<div class="shelf-empty">收藏夹是空的<br><br>在任何书卡片上点 <b>☆ 收藏</b> 即可加入</div>';
     return;
   }
-  let html = `<div class="drawer-section"><h4>共 ${keys.length} 本</h4><div class="drawer-section">`;
+  let html = `<div class="drawer-section"><h4 style="margin:0 0 8px;font-size:11px;color:var(--fg-faint);letter-spacing:.06em;text-transform:uppercase">共 ${keys.length} 本</h4>`;
   keys.forEach(idx => {
-    const b = state.index[+idx];
+    const b = state.index.find(x => x.i == idx);
     if (!b) return;
     html += `
-      <div class="shelf-item">
-        <div class="shelf-item-title">
-          <div>${escapeHtml(b.t)}</div>
-          <div style="font-size:11px;color:var(--fg-faint);margin-top:2px">${escapeHtml(b.a || '佚名')} · ${escapeHtml(b.c)}</div>
+      <div class="shelf-item" style="display:flex;gap:10px;padding:10px 0;border-bottom:1px solid var(--line-soft);align-items:flex-start">
+        <div style="flex:1;min-width:0">
+          <div style="font-size:13px;font-weight:500">${escapeHtml(b.t)}</div>
+          <div style="font-size:11px;color:var(--fg-faint);margin-top:2px">${escapeHtml(b.a || '佚名')} · ${escapeHtml(b.c)}${b.local ? ' · 📂 本地' : ''}</div>
         </div>
         <button class="btn btn-primary" data-dl="${idx}" style="font-size:11px;padding:4px 8px">下载</button>
-        <button class="shelf-item-remove" data-rm="${idx}" aria-label="移除">×</button>
+        <button class="btn btn-ghost" data-rm="${idx}" style="padding:4px 8px">×</button>
       </div>
     `;
   });
-  html += '</div></div>';
+  html += '</div>';
   els.drawerBody.innerHTML = html;
-  els.drawerBody.querySelectorAll('[data-dl]').forEach(btn =>
-    btn.addEventListener('click', () => downloadOne(+btn.dataset.dl))
-  );
-  els.drawerBody.querySelectorAll('[data-rm]').forEach(btn =>
-    btn.addEventListener('click', () => {
-      delete state.shelf[btn.dataset.rm];
-      saveShelf(); updateBookshelfCount(); renderBookshelf(); applyFilter();
-    })
-  );
+  els.drawerBody.querySelectorAll('[data-dl]').forEach(btn => btn.addEventListener('click', () => downloadOne(state.index.findIndex(x => x.i == btn.dataset.dl))));
+  els.drawerBody.querySelectorAll('[data-rm]').forEach(btn => btn.addEventListener('click', () => {
+    delete state.shelf[btn.dataset.rm];
+    saveLS(LS_KEYS.shelf, state.shelf);
+    updateCounts(); renderBookshelf(); applyFilter();
+  }));
 }
+
+// ---------- 免责声明 ----------
+els.disclaimerClose.addEventListener('click', () => {
+  els.disclaimer.classList.add('hidden');
+  saveLS(LS_KEYS.hidden, true);
+});
+els.openDisclaimerBtn.addEventListener('click', () => { els.disclaimerDrawer.classList.add('show'); els.drawerBg.classList.add('show'); });
+els.openDisclaimerBtn2.addEventListener('click', els.openDisclaimerBtn.click);
+
+// ---------- 上传 ----------
+function populateUploadGroups() {
+  els.upGroup.innerHTML = '<option value="">— 自动判断 —</option>' +
+    state.meta.taxonomy.filter(g => !g.is_long_tail).map(g => `<option value="${escapeAttr(g.name)}">${escapeHtml(g.name)}</option>`).join('');
+}
+function openUpload() { renderUploadList(); els.uploadDrawer.classList.add('show'); els.drawerBg.classList.add('show'); }
+els.openUploadBtn.addEventListener('click', openUpload);
+
+let _selectedFile = null;
+function setupUploader() {
+  const onPick = (file) => {
+    _selectedFile = file;
+    if (file) {
+      const sizeKB = (file.size / 1024).toFixed(1);
+      els.upFileInfo.innerHTML = `<strong>${escapeHtml(file.name)}</strong> · ${sizeKB} KB · ${file.type || '未知类型'}`;
+      els.upDrop.classList.add('has-file');
+    } else {
+      els.upFileInfo.textContent = '支持 txt / mobi / epub / azw3 / pdf';
+      els.upDrop.classList.remove('has-file');
+    }
+  };
+  els.upDrop.addEventListener('click', () => els.upFile.click());
+  els.upFile.addEventListener('change', e => onPick(e.target.files[0]));
+  els.upDrop.addEventListener('dragover', e => { e.preventDefault(); els.upDrop.style.borderColor = 'var(--accent)'; });
+  els.upDrop.addEventListener('dragleave', () => els.upDrop.style.borderColor = '');
+  els.upDrop.addEventListener('drop', e => {
+    e.preventDefault();
+    els.upDrop.style.borderColor = '';
+    if (e.dataTransfer.files.length) onPick(e.dataTransfer.files[0]);
+  });
+
+  els.uploadForm.addEventListener('submit', async e => {
+    e.preventDefault();
+    if (!_selectedFile) { toast('请先选择文件'); return; }
+    const title = els.upTitle.value.trim();
+    if (!title) { toast('书名必填'); return; }
+    // 检查 localStorage 配额
+    const dataUrl = await fileToDataUrl(_selectedFile);
+    const sizeKB = (_selectedFile.size / 1024).toFixed(1);
+    if (_selectedFile.size > 30 * 1024 * 1024) {
+      toast(`文件过大 (${sizeKB} KB),localStorage 最多 ~5MB,推荐 <2MB`); return;
+    }
+    const upload = {
+      id: 'u' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+      t: title,
+      a: els.upAuthor.value.trim(),
+      c: '',
+      d: els.upDesc.value.trim() || '本地上传',
+      g: els.upGroup.value || '其他细分',
+      p: '—', y: '—', lang: 'ZH',
+      f: _selectedFile.name.split('.').pop().toLowerCase(),
+      _filename: _selectedFile.name,
+      _mime: _selectedFile.type || 'application/octet-stream',
+      _dataUrl: dataUrl,
+      _addedAt: Date.now(),
+    };
+    try {
+      state.uploads.push(upload);
+      saveLS(LS_KEYS.uploads, state.uploads);
+      rebuildMergedIndex();
+      renderStats();
+      updateCounts();
+      applyFilter();
+      // reset form
+      els.uploadForm.reset(); _selectedFile = null;
+      els.upFileInfo.textContent = '支持 txt / mobi / epub / azw3 / pdf';
+      els.upDrop.classList.remove('has-file');
+      renderUploadList();
+      toast(`已添加: 《${title}》 (${sizeKB} KB)`);
+    } catch (err) {
+      state.uploads.pop();
+      console.error(err);
+      toast('存储失败:' + (err.message || 'localStorage 空间不足'));
+    }
+  });
+}
+
+function renderUploadList() {
+  if (state.uploads.length === 0) {
+    els.uploadList.innerHTML = '';
+    return;
+  }
+  let html = `<h4 style="margin:0 0 8px;font-size:11px;color:var(--fg-faint);letter-spacing:.06em;text-transform:uppercase">已添加 ${state.uploads.length} 本</h4>`;
+  state.uploads.slice().reverse().forEach(u => {
+    const sizeKB = u._dataUrl ? Math.round((u._dataUrl.length * 0.75) / 1024) + ' KB' : '';
+    html += `<div style="padding:8px 0;border-bottom:1px solid var(--line-soft);display:flex;gap:8px;align-items:center">
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px;font-weight:500">${escapeHtml(u.t)}</div>
+        <div style="font-size:11px;color:var(--fg-faint)">${escapeHtml(u.a || '佚名')} · ${escapeHtml(u.g)} · ${sizeKB}</div>
+      </div>
+      <button class="btn btn-primary" data-dl-local="${u.id}" style="font-size:11px;padding:3px 7px">下载</button>
+      <button class="btn btn-ghost" data-rm-local="${u.id}" style="padding:3px 7px">×</button>
+    </div>`;
+  });
+  els.uploadList.innerHTML = html;
+  els.uploadList.querySelectorAll('[data-dl-local]').forEach(btn => btn.addEventListener('click', () => {
+    const u = state.uploads.find(x => x.id === btn.dataset.dlLocal);
+    if (u) downloadBlob(u._dataUrl, u._filename, u._mime);
+  }));
+  els.uploadList.querySelectorAll('[data-rm-local]').forEach(btn => btn.addEventListener('click', () => {
+    state.uploads = state.uploads.filter(x => x.id !== btn.dataset.rmLocal);
+    saveLS(LS_KEYS.uploads, state.uploads);
+    rebuildMergedIndex();
+    renderStats();
+    updateCounts();
+    applyFilter();
+    renderUploadList();
+    toast('已移除');
+  }));
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+}
+
+// ---------- Drawer 通用关闭 ----------
+document.querySelectorAll('[data-close]').forEach(el => {
+  el.addEventListener('click', () => {
+    const id = el.dataset.close;
+    document.getElementById(id).classList.remove('show');
+    els.drawerBg.classList.remove('show');
+  });
+});
+els.drawerBg.addEventListener('click', () => {
+  [els.drawer, els.uploadDrawer, els.disclaimerDrawer].forEach(d => d.classList.remove('show'));
+  els.drawerBg.classList.remove('show');
+});
+
+// ---------- 移动端 sidebar ----------
+const isMobile = () => window.matchMedia('(max-width:900px)').matches;
+els.toggleSidebarBtn.addEventListener('click', () => {
+  els.sidebar.classList.toggle('open');
+  els.sidebarOverlay.classList.toggle('show');
+});
+els.sidebarOverlay.addEventListener('click', () => {
+  els.sidebar.classList.remove('open');
+  els.sidebarOverlay.classList.remove('show');
+});
+function handleResize() {
+  els.toggleSidebarBtn.style.display = isMobile() ? '' : 'none';
+}
+window.addEventListener('resize', handleResize);
+handleResize();
 
 // ---------- Toast ----------
 let toastTimer;
@@ -394,11 +740,18 @@ function highlight(text, kw) {
   return out.join('');
 }
 function downloadBlob(content, filename, mime) {
-  const blob = new Blob([content], { type: mime });
+  const blob = (content.startsWith('data:')) ? dataUrlToBlob(content) : new Blob([content], { type: mime });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = filename; document.body.appendChild(a);
   a.click(); setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
+}
+function dataUrlToBlob(dataUrl) {
+  const [head, b64] = dataUrl.split(',');
+  const mime = head.match(/data:(.*?);/)[1];
+  const bin = atob(b64); const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: mime });
 }
 function formatBytes(n) {
   if (n < 1024) return n + ' B';

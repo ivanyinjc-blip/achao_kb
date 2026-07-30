@@ -117,9 +117,17 @@ async function init() {
 }
 
 function rebuildMergedIndex() {
-  // 远端在前(保留正向 id),本地的 id 用负数,避免冲突
+  // 远端 local(从 index.json 来的负 id,有 GitHub URL) — 标 local,绑定 l
+  for (const b of state.remoteIndex) {
+    if (b.i < 0) {
+      b.local = true;
+      b._remoteUrl = b.l || '';
+    }
+  }
+  // 本地 upload(localStorage 里的) — id 用 -(len + i + 1) 避免和远端负 id 冲突
+  const remoteNegCount = state.remoteIndex.filter(b => b.i < 0).length;
   state.localIndex = state.uploads.map((u, i) => ({
-    i: -(i + 1), t: u.t, a: u.a || '', c: u.c || '',
+    i: -(remoteNegCount + i + 1), t: u.t, a: u.a || '', c: u.c || '',
     d: u.d || '本地上传', p: u.p || '—', y: u.y || '—',
     lang: u.lang || '—', g: u.g || '其他细分',
     l: '', f: u.f ? [u.f] : [], local: true, _uploadId: u.id,
@@ -178,9 +186,9 @@ function renderHot() {
     .slice(0, 10)
     .filter(x => x.n > 0)
     .map(x => {
-      const b = state.remoteIndex[x.i];
+      const b = state.index[x.i];
       if (!b) return null;
-      return { i: x.i, t: b.t, a: b.a, c: b.c, _userClicks: x.n };
+      return { i: x.i, t: b.t, a: b.a, c: b.c, _userClicks: x.n, local: b.local };
     })
     .filter(Boolean);
 
@@ -210,13 +218,13 @@ function renderHot() {
   els.hotList.querySelectorAll('[data-hot-i]').forEach(el => {
     el.addEventListener('click', () => {
       const i = parseInt(el.dataset.hotI);
-      const b = state.remoteIndex[i];
+      const b = state.index[i];
       if (b) {
         state.query = b.t;
         els.searchInput.value = b.t;
         els.searchWrap.classList.add('has-query');
         applyFilter();
-        toast(`跳到《${b.t}》`);
+        toast(`跳到《${b.t}》${b.local ? ' · 本地' : ''}`);
       }
     });
   });
@@ -226,19 +234,22 @@ function renderHot() {
 function renderStats() {
   const m = state.meta;
   const authors = new Set();
+  const remoteLocalCount = state.remoteIndex.filter(b => b.local).length;
   for (const b of state.remoteIndex) if (b.a) authors.add(b.a);
   els.stats.innerHTML = `
-    <div class="stat"><div class="stat-num">${(m.total + state.localIndex.length).toLocaleString()}</div><div class="stat-label">总书目</div></div>
+    <div class="stat"><div class="stat-num">${state.index.length.toLocaleString()}</div><div class="stat-label">总书目</div></div>
     <div class="stat"><div class="stat-num">${m.taxonomy.filter(g => !g.is_long_tail).length}</div><div class="stat-label">一级目录</div></div>
     <div class="stat"><div class="stat-num">${m.categories.toLocaleString()}</div><div class="stat-label">细分标签</div></div>
     <div class="stat"><div class="stat-num">${authors.size.toLocaleString()}</div><div class="stat-label">作者</div></div>
-    <div class="stat"><div class="stat-num">${state.localIndex.length}</div><div class="stat-label">本地上传</div></div>
+    <div class="stat"><div class="stat-num">${remoteLocalCount + state.localIndex.length}</div><div class="stat-label">本地上传</div></div>
   `;
 }
 
 function updateCounts() {
+  const remoteLocal = state.remoteIndex.filter(b => b.local).length;
+  const totalLocal = remoteLocal + state.localIndex.length;
   els.navAllCount.textContent = state.index.length.toLocaleString();
-  els.navLocalCount.textContent = state.localIndex.length;
+  els.navLocalCount.textContent = totalLocal;
   els.navShelfCount.textContent = Object.keys(state.shelf).filter(k => state.shelf[k]).length;
   els.bookshelfCount.textContent = els.navShelfCount.textContent;
   // nav active
@@ -393,10 +404,12 @@ async function downloadOne(idx) {
   const b = state.index[idx];
   if (!b) return;
   if (b.local) {
-    // 本地: 从 uploads 找到,生成 blob 下载
+    recordClick(idx);
+    // 优先: 远端 URL(GitHub release, 公共直链)
+    if (b._remoteUrl) { window.open(b._remoteUrl, '_blank', 'noopener'); return; }
+    // 兜底: localStorage 里的 dataURL
     const u = state.uploads.find(x => x.id === b._uploadId);
     if (!u) { toast('本地文件丢失'); return; }
-    recordClick(idx);
     downloadBlob(u._dataUrl, u._filename, u._mime);
     return;
   }
@@ -430,13 +443,18 @@ els.fabDownload.addEventListener('click', async () => {
     const b = state.index[id];
     if (!b) continue;
     if (b.local) {
-      const u = state.uploads.find(x => x.id === b._uploadId);
-      if (u) { downloadBlob(u._dataUrl, u._filename, u._mime); opened++; }
+      if (b._remoteUrl) {
+        setTimeout(() => window.open(b._remoteUrl, '_blank', 'noopener'), opened * 200);
+        opened++;
+      } else {
+        const u = state.uploads.find(x => x.id === b._uploadId);
+        if (u) { downloadBlob(u._dataUrl, u._filename, u._mime); opened++; }
+      }
     } else {
       try {
         const books = await ensureRemoteBooks();
         const full = books[id];
-        if (full && full.l) { setTimeout(() => window.open(full.l, '_blank', 'noopener'), opened * 250); opened++; }
+        if (full && full.l) { setTimeout(() => window.open(full.l, '_blank', 'noopener'), opened * 200); opened++; }
       } catch {}
     }
   }
@@ -452,8 +470,11 @@ els.fabExport.addEventListener('click', async () => {
       if (!b) continue;
       let url = '';
       if (b.local) {
-        const u = state.uploads.find(x => x.id === b._uploadId);
-        url = u ? `[本地文件 ${u._filename}]` : '';
+        if (b._remoteUrl) url = b._remoteUrl;
+        else {
+          const u = state.uploads.find(x => x.id === b._uploadId);
+          url = u ? `[本地文件 ${u._filename}]` : '';
+        }
       } else {
         const books = await ensureRemoteBooks();
         url = books[id]?.l || '';

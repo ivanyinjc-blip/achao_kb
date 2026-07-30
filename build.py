@@ -80,6 +80,22 @@ def slim_full(b, idx):
         'l': b['link'], 'f': b.get('formats', []),
     }
 
+def slim_local(b, idx, url):
+    """本地书: 用 -idx 区分,标记 local,带 GitHub release URL"""
+    title = b.get('title', '').strip() or Path(b['src']).stem
+    author = b.get('author', '').strip()
+    ext = b.get('ext', b['key'].rsplit('.', 1)[-1] if '.' in b['key'] else '')
+    # 简单分类
+    cat = classify_top(title) if title else '其他细分'
+    return {
+        'i': -idx, 't': title, 'a': author,
+        'c': cat, 'd': f'本地上传 · {ext.upper()}',
+        'p': '—', 'y': extract_year(title),
+        'lang': 'ZH', 'g': cat,
+        'l': url, 'f': [ext.upper()] if ext else [],
+        'local': True,
+    }
+
 def slim_index(full):
     return {k: full[k] for k in ('i','t','a','c','d','p','y','lang','g')}
 
@@ -87,6 +103,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--raw', default='data/books.json')
     ap.add_argument('--out', default='site/data')
+    ap.add_argument('--local', default='site/data/local_books.json',
+                    help='local_books.json 路径(包含 src/title/author/key)')
+    ap.add_argument('--local-urls', default='/tmp/book_urls.json',
+                    help='book_urls.json 路径(key -> GitHub URL 映射)')
     args = ap.parse_args()
 
     raw_path = Path(args.raw); out_path = Path(args.out)
@@ -127,6 +147,25 @@ def main():
                                 'c':b['category'], 'score':score})
 
     full = [slim_full(b, i) for i, b in enumerate(raw)]
+
+    # 本地书(可选): 需要 local_books.json + book_urls.json 都存在
+    local_full = []
+    local_path = Path(args.local)
+    urls_path = Path(args.local_urls)
+    if local_path.exists() and urls_path.exists():
+        local_src = json.load(open(local_path))
+        url_map = json.load(open(urls_path))
+        added = 0
+        for j, lb in enumerate(local_src.get('books', [])):
+            key = lb['key']
+            url = url_map.get(key)
+            if not url: continue  # 没传完的跳过
+            local_full.append(slim_local(lb, j + 1, url))
+            added += 1
+        if added:
+            print(f'>> local: 合并 {added} 本 (来自 {local_path.name} + {urls_path.name})')
+            full.extend(local_full)
+
     index = [slim_index(b) for b in full]
 
     taxonomy = []
@@ -145,7 +184,8 @@ def main():
         })
 
     meta = {
-        'total': len(full), 'categories': len(cat_counter),
+        'total': len(raw), 'categories': len(cat_counter),
+        'local_count': len(local_full),
         'taxonomy': taxonomy,
         'popular': [{'i':idx, 't':raw[idx]['title'].strip(),
                      'a':raw[idx].get('author','').strip(),

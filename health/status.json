@@ -1,0 +1,30 @@
+{
+  "last_check": "2026-07-31T16:14:55+08:00",
+  "status": "ok",
+  "endpoints": [
+    {
+      "name": "主页",
+      "ok": true,
+      "http": 200,
+      "ms": 899
+    },
+    {
+      "name": "Meta",
+      "ok": true,
+      "http": 200,
+      "ms": 923
+    },
+    {
+      "name": "Index",
+      "ok": true,
+      "http": 200,
+      "ms": 791
+    },
+    {
+      "name": "本地书直链",
+      "ok": false,
+      "http": 0,
+      "ms": 11095
+    }
+  ]
+}

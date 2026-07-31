@@ -311,6 +311,18 @@ function applyFilter() {
   updateCounts();
 }
 
+// ---------- 语言代码 -> 友好中文名 ----------
+const LANG_MAP = {
+  ZH: '中文', EN: '英文', JA: '日文', KO: '韩文',
+  FR: '法文', DE: '德文', ES: '西班牙文', RU: '俄文',
+  IT: '意大利文', PT: '葡萄牙文', AR: '阿拉伯文',
+};
+function langLabel(raw) {
+  if (!raw || raw === '—') return '';
+  const k = String(raw).trim().toUpperCase();
+  return LANG_MAP[k] || raw;
+}
+
 // ---------- 卡片 ----------
 function renderGrid(items) {
   if (items.length === 0) {
@@ -330,11 +342,13 @@ function renderGrid(items) {
     const titleHtml = matched ? highlight(b.t, matched.k) : escapeHtml(b.t);
     const authorHtml = b.a ? (matched ? highlight(b.a, matched.k) : escapeHtml(b.a)) : '<span style="opacity:.4">佚名</span>';
 
-    // meta line: 出版社 · 年份 · 语言
+    // meta line: 出版社 · 年份 · 语言(中文为默认值, 不显示;非中文显示翻译名)
+    const lang = langLabel(b.lang);
+    const showLang = lang && lang !== '中文';
     const metaParts = [];
     if (b.p && b.p !== '—') metaParts.push(`<span>出版社: ${escapeHtml(b.p)}</span>`);
     if (b.y && b.y !== '—') metaParts.push(`<span>${escapeHtml(b.y)}</span>`);
-    if (b.lang && b.lang !== '—') metaParts.push(`<span>${escapeHtml(b.lang)}</span>`);
+    if (showLang) metaParts.push(`<span>${escapeHtml(lang)}</span>`);
     const metaHtml = metaParts.length ? metaParts.join('<span class="sep">·</span>') : '';
 
     card.innerHTML = `
@@ -344,7 +358,7 @@ function renderGrid(items) {
           <p class="card-title">${titleHtml}</p>
           <p class="card-author">${authorHtml}</p>
           ${metaHtml ? `<p class="card-meta">${metaHtml}</p>` : ''}
-          <p class="card-desc">${escapeHtml(b.d)}</p>
+          ${b.d ? `<p class="card-desc">${escapeHtml(b.d)}</p>` : ''}
           <div class="card-foot">
             <span class="card-tag ${b.local ? 'local' : ''}">${escapeHtml(b.c || b.g)}</span>
             <span class="card-formats">${(b.f || []).slice(0,3).map(f => `<span class="fmt">${escapeHtml(f)}</span>`).join('') || '<span class="fmt">本地</span>'}</span>
@@ -421,12 +435,6 @@ async function downloadOne(idx) {
     recordClick(idx);
     window.open(full.l, '_blank', 'noopener');
   } catch (e) { toast('加载失败'); }
-}
-
-function recordClick(idx) {
-  state.clicks[idx] = (state.clicks[idx] || 0) + 1;
-  saveLS(LS_KEYS.clicks, state.clicks);
-  renderHot();
 }
 
 // ---------- FAB ----------

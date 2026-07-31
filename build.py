@@ -60,14 +60,14 @@ def classify_top(cat):
     return '其他细分'
 
 def gen_desc(cat, title):
-    base = DESC_TEMPLATES.get(cat, f'{cat}主题')
+    # 只对有信息量的后缀标注: 全集 / 套装 / 合集,其余返回空字符串(前端会隐藏)
+    if '全集' in title:
+        return '全集'
     if '套装' in title or ('共' in title and '册' in title):
-        suf = '(系列/套装)'
-    elif '全集' in title:
-        suf = '(全集)'
-    else:
-        suf = ''
-    return f'{base}{suf}'
+        return '套装'
+    if '合集' in title:
+        return '合集'
+    return ''
 
 def slim_full(b, idx):
     cat = b['category']
